@@ -150,10 +150,12 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ normal_opacity,
+	const float* __restrict__ normal_opacity_geo,
 	const float* __restrict__ transMats,
 	const float* __restrict__ colors,
 	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
+	const float* __restrict__ final_Ts_geo,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_depths,
@@ -161,6 +163,7 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float* __restrict__ dL_dnormal3D,
 	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dopacity_geo,
 	float* __restrict__ dL_dcolors)
 {
 	// We rasterize again. Compute necessary block info.
@@ -183,6 +186,7 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_normal_opacity[BLOCK_SIZE];
+	__shared__ float collected_normal_opacity_geo[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
@@ -192,7 +196,9 @@ renderCUDA(
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
 	const float T_final = inside ? final_Ts[pix_id] : 0;
+	const float T_final_geo = inside ? final_Ts_geo[pix_id] : 0;
 	float T = T_final;
+	float T_geo = T_final_geo;
 
 	// We start from the back. The ID of the last contributing
 	// Gaussian is known from each pixel from the forward.
@@ -206,6 +212,7 @@ renderCUDA(
 	float dL_dreg;
 	float dL_ddepth;
 	float dL_daccum;
+	float dL_daccum_geo;
 	float dL_dnormal2D[3];
 	const int median_contributor = inside ? n_contrib[pix_id + H * W] : 0;
 	float dL_dmedian_depth;
@@ -214,6 +221,7 @@ renderCUDA(
 	if (inside) {
 		dL_ddepth = dL_depths[DEPTH_OFFSET * H * W + pix_id];
 		dL_daccum = dL_depths[ALPHA_OFFSET * H * W + pix_id];
+		dL_daccum_geo = dL_depths[ALPHA_GEO_OFFSET * H * W + pix_id];
 		dL_dreg = dL_depths[DISTORTION_OFFSET * H * W + pix_id];
 		for (int i = 0; i < 3; i++) 
 			dL_dnormal2D[i] = dL_depths[(NORMAL_OFFSET + i) * H * W + pix_id];
@@ -227,12 +235,14 @@ renderCUDA(
 	float last_normal[3] = { 0 };
 	float accum_depth_rec = 0;
 	float accum_alpha_rec = 0;
+	float accum_alpha_geo_rec = 0;
 	float accum_normal_rec[3] = {0};
 	// for compute gradient with respect to the distortion map
-	const float final_D = inside ? final_Ts[pix_id + H * W] : 0;
-	const float final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
-	const float final_A = 1 - T_final;
+	const float final_D = inside ? final_Ts_geo[pix_id + H * W] : 0;
+	const float final_D2 = inside ? final_Ts_geo[pix_id + 2 * H * W] : 0;
+	const float final_A = 1 - T_final_geo;
 	float last_dL_dT = 0;
+	float last_dL_dT_geo = 0;
 #endif
 
 	if (inside){
@@ -241,6 +251,7 @@ renderCUDA(
 	}
 
 	float last_alpha = 0;
+	float last_alpha_geo = 0;
 	float last_color[C] = { 0 };
 
 	// Gradient of pixel coordinate w.r.t. normalized 
@@ -261,6 +272,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_normal_opacity[block.thread_rank()] = normal_opacity[coll_id];
+			collected_normal_opacity_geo[block.thread_rank()] = normal_opacity_geo[coll_id];
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
@@ -302,8 +314,10 @@ renderCUDA(
 			if (c_d < near_n) continue;
 			
 			float4 nor_o = collected_normal_opacity[j];
+			float nor_o_geo = collected_normal_opacity_geo[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
+			float opa_geo = nor_o_geo;
 
 			// accumulations
 
@@ -313,16 +327,20 @@ renderCUDA(
 
 			const float G = exp(power);
 			const float alpha = min(0.99f, opa * G);
+			const float alpha_geo = min(0.99f, opa_geo * G);
 			if (alpha < 1.0f / 255.0f)
 				continue;
 
 			T = T / (1.f - alpha);
+			T_geo = T_geo / (1.f - alpha_geo);
 			const float dchannel_dcolor = alpha * T;
 			const float w = alpha * T;
+			const float w_geo = alpha_geo * T_geo;
 			// Propagate gradients to per-Gaussian colors and keep
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
 			float dL_dalpha = 0.0f;
+			float dL_dalpha_geo = 0.0f;
 			const int global_id = collected_id[j];
 			for (int ch = 0; ch < C; ch++)
 			{
@@ -355,32 +373,37 @@ renderCUDA(
 #else
 			dL_dweight += (final_D2 + m_d * m_d * final_A - 2 * m_d * final_D) * dL_dreg;
 #endif
-			dL_dalpha += dL_dweight - last_dL_dT;
+			dL_dalpha_geo += dL_dweight - last_dL_dT_geo;
 			// propagate the current weight W_{i} to next weight W_{i-1}
-			last_dL_dT = dL_dweight * alpha + (1 - alpha) * last_dL_dT;
-			const float dL_dmd = 2.0f * (T * alpha) * (m_d * final_A - final_D) * dL_dreg;
+			last_dL_dT_geo = dL_dweight * alpha_geo + (1 - alpha_geo) * last_dL_dT_geo;
+			const float dL_dmd = 2.0f * (T_geo * alpha_geo) * (m_d * final_A - final_D) * dL_dreg;
 			dL_dz += dL_dmd * dmd_dd;
 
 			// Propagate gradients w.r.t ray-splat depths
-			accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
+			accum_depth_rec = last_alpha_geo * last_depth + (1.f - last_alpha_geo) * accum_depth_rec;
 			last_depth = c_d;
-			dL_dalpha += (c_d - accum_depth_rec) * dL_ddepth;
+			dL_dalpha_geo += (c_d - accum_depth_rec) * dL_ddepth;
 			// Propagate gradients w.r.t. color ray-splat alphas
 			accum_alpha_rec = last_alpha * 1.0 + (1.f - last_alpha) * accum_alpha_rec;
 			dL_dalpha += (1 - accum_alpha_rec) * dL_daccum;
 
+			accum_alpha_geo_rec = last_alpha_geo * 1.0 + (1.f - last_alpha_geo) * accum_alpha_geo_rec;
+			dL_dalpha_geo += (1 - accum_alpha_geo_rec) * dL_daccum_geo;
+
 			// Propagate gradients to per-Gaussian normals
 			for (int ch = 0; ch < 3; ch++) {
-				accum_normal_rec[ch] = last_alpha * last_normal[ch] + (1.f - last_alpha) * accum_normal_rec[ch];
+				accum_normal_rec[ch] = last_alpha_geo * last_normal[ch] + (1.f - last_alpha_geo) * accum_normal_rec[ch];
 				last_normal[ch] = normal[ch];
-				dL_dalpha += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
-				atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha * T * dL_dnormal2D[ch]);
+				dL_dalpha_geo += (normal[ch] - accum_normal_rec[ch]) * dL_dnormal2D[ch];
+				atomicAdd((&dL_dnormal3D[global_id * 3 + ch]), alpha_geo * T_geo * dL_dnormal2D[ch]);
 			}
 #endif
 
 			dL_dalpha *= T;
+			dL_dalpha_geo *= T_geo;
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
+			last_alpha_geo = alpha_geo;
 
 			// Account for fact that alpha also influences how much of
 			// the background color is added if nothing left to blend
@@ -391,9 +414,9 @@ renderCUDA(
 
 
 			// Helpful reusable temporary variables
-			const float dL_dG = nor_o.w * dL_dalpha;
+			const float dL_dG = nor_o.w * dL_dalpha + nor_o_geo * dL_dalpha_geo;
 #if RENDER_AXUTILITY
-			dL_dz += alpha * T * dL_ddepth; 
+			dL_dz += alpha_geo * T_geo * dL_ddepth; 
 #endif
 
 			if (rho3d <= rho2d) {
@@ -441,6 +464,7 @@ renderCUDA(
 
 			// Update gradients w.r.t. opacity of the Gaussian
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			atomicAdd(&(dL_dopacity_geo[global_id]), G * dL_dalpha_geo);
 		}
 	}
 }
@@ -697,10 +721,12 @@ void BACKWARD::render(
 	const float* bg_color,
 	const float2* means2D,
 	const float4* normal_opacity,
+	const float* normal_opacity_geo,
 	const float* colors,
 	const float* transMats,
 	const float* depths,
 	const float* final_Ts,
+	const float* final_Ts_geo,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
 	const float* dL_depths,
@@ -708,6 +734,7 @@ void BACKWARD::render(
 	float3* dL_dmean2D,
 	float* dL_dnormal3D,
 	float* dL_dopacity,
+	float* dL_dopacity_geo,
 	float* dL_dcolors)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
@@ -718,10 +745,12 @@ void BACKWARD::render(
 		bg_color,
 		means2D,
 		normal_opacity,
+		normal_opacity_geo,
 		transMats,
 		colors,
 		depths,
 		final_Ts,
+		final_Ts_geo,
 		n_contrib,
 		dL_dpixels,
 		dL_depths,
@@ -729,6 +758,7 @@ void BACKWARD::render(
 		dL_dmean2D,
 		dL_dnormal3D,
 		dL_dopacity,
+		dL_dopacity_geo,
 		dL_dcolors
 		);
 }

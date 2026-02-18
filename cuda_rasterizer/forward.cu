@@ -152,6 +152,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* opacities_geo,
 	const float* shs,
 	bool* clamped,
 	const float* transMat_precomp,
@@ -168,6 +169,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
+	float* normal_opacity_geo,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -247,6 +249,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = (int)radius;
 	points_xy_image[idx] = point_image;
 	normal_opacity[idx] = {normal.x, normal.y, normal.z, opacities[idx]};
+	normal_opacity_geo[idx] = opacities_geo[idx];
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -265,7 +268,9 @@ renderCUDA(
 	const float* __restrict__ transMats,
 	const float* __restrict__ depths,
 	const float4* __restrict__ normal_opacity,
+	const float* __restrict__ normal_opacity_geo,
 	float* __restrict__ final_T,
+	float* __restrict__ final_T_geo,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
@@ -294,12 +299,14 @@ renderCUDA(
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_normal_opacity[BLOCK_SIZE];
+	__shared__ float collected_normal_opacity_geo[BLOCK_SIZE];
 	__shared__ float3 collected_Tu[BLOCK_SIZE];
 	__shared__ float3 collected_Tv[BLOCK_SIZE];
 	__shared__ float3 collected_Tw[BLOCK_SIZE];
 
 	// Initialize helper variables
 	float T = 1.0f;
+	float T_geo = 1.0f;
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
@@ -311,6 +318,8 @@ renderCUDA(
 	float D = { 0 };
 	float M1 = {0};
 	float M2 = {0};
+	float M1_geo = {0};
+	float M2_geo = {0};
 	float distortion = {0};
 	float median_depth = {0};
 	// float median_weight = {0};
@@ -334,6 +343,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_normal_opacity[block.thread_rank()] = normal_opacity[coll_id];
+			collected_normal_opacity_geo[block.thread_rank()] = normal_opacity_geo[coll_id];
 			collected_Tu[block.thread_rank()] = {transMats[9 * coll_id+0], transMats[9 * coll_id+1], transMats[9 * coll_id+2]};
 			collected_Tv[block.thread_rank()] = {transMats[9 * coll_id+3], transMats[9 * coll_id+4], transMats[9 * coll_id+5]};
 			collected_Tw[block.thread_rank()] = {transMats[9 * coll_id+6], transMats[9 * coll_id+7], transMats[9 * coll_id+8]};
@@ -372,8 +382,10 @@ renderCUDA(
 			if (depth < near_n) continue;
 
 			float4 nor_o = collected_normal_opacity[j];
+			float nor_o_geo = collected_normal_opacity_geo[j];
 			float normal[3] = {nor_o.x, nor_o.y, nor_o.z};
 			float opa = nor_o.w;
+			float opa_geo = nor_o_geo;
 
 			float power = -0.5f * rho;
 			if (power > 0.0f)
@@ -384,9 +396,11 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, opa * exp(power));
+			float alpha_geo = min(0.99f, opa_geo * exp(power));
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
+			float test_T_geo = T_geo * (1 - alpha_geo);
 			if (test_T < 0.0001f)
 			{
 				done = true;
@@ -394,29 +408,33 @@ renderCUDA(
 			}
 
 			float w = alpha * T;
+			float w_geo = alpha_geo * T_geo;
 #if RENDER_AXUTILITY
 			// Render depth distortion map
 			// Efficient implementation of distortion loss, see 2DGS' paper appendix.
-			float A = 1-T;
+			float A = 1-T_geo;
 			float m = far_n / (far_n - near_n) * (1 - near_n / depth);
-			distortion += (m * m * A + M2 - 2 * m * M1) * w;
-			D  += depth * w;
+			distortion += (m * m * A + M2_geo - 2 * m * M1_geo) * w_geo;
+			D  += depth * w_geo;
+			M1_geo += m * w_geo;
+			M2_geo += m * m * w_geo;
 			M1 += m * w;
 			M2 += m * m * w;
 
-			if (T > 0.5) {
+			if (T_geo > 0.5) {
 				median_depth = depth;
 				// median_weight = w;
 				median_contributor = contributor;
 			}
 			// Render normal map
-			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w;
+			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w_geo;
 #endif
 
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * w;
 			T = test_T;
+			T_geo = test_T_geo;
 
 			// Keep track of last range entry to update this
 			// pixel.
@@ -429,6 +447,7 @@ renderCUDA(
 	if (inside)
 	{
 		final_T[pix_id] = T;
+		final_T_geo[pix_id] = T_geo;
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
@@ -437,11 +456,14 @@ renderCUDA(
 		n_contrib[pix_id + H * W] = median_contributor;
 		final_T[pix_id + H * W] = M1;
 		final_T[pix_id + 2 * H * W] = M2;
+		final_T_geo[pix_id + H * W] = M1_geo;
+		final_T_geo[pix_id + 2 * H * W] = M2_geo;
 		out_others[pix_id + DEPTH_OFFSET * H * W] = D;
 		out_others[pix_id + ALPHA_OFFSET * H * W] = 1 - T;
 		for (int ch=0; ch<3; ch++) out_others[pix_id + (NORMAL_OFFSET+ch) * H * W] = N[ch];
 		out_others[pix_id + MIDDEPTH_OFFSET * H * W] = median_depth;
 		out_others[pix_id + DISTORTION_OFFSET * H * W] = distortion;
+		out_others[pix_id + ALPHA_GEO_OFFSET * H * W] = 1 - T_geo;
 		// out_others[pix_id + MEDIAN_WEIGHT_OFFSET * H * W] = median_weight;
 #endif
 	}
@@ -458,7 +480,9 @@ void FORWARD::render(
 	const float* transMats,
 	const float* depths,
 	const float4* normal_opacity,
+	const float* normal_opacity_geo,
 	float* final_T,
+	float* final_T_geo,
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
@@ -474,7 +498,9 @@ void FORWARD::render(
 		transMats,
 		depths,
 		normal_opacity,
+		normal_opacity_geo,
 		final_T,
+		final_T_geo,
 		n_contrib,
 		bg_color,
 		out_color,
@@ -487,6 +513,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	const float scale_modifier,
 	const glm::vec4* rotations,
 	const float* opacities,
+	const float* opacities_geo,
 	const float* shs,
 	bool* clamped,
 	const float* transMat_precomp,
@@ -503,6 +530,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float* transMats,
 	float* rgb,
 	float4* normal_opacity,
+	float* normal_opacity_geo,
 	const dim3 grid,
 	uint32_t* tiles_touched,
 	bool prefiltered)
@@ -514,6 +542,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		scale_modifier,
 		rotations,
 		opacities,
+		opacities_geo,
 		shs,
 		clamped,
 		transMat_precomp,
@@ -530,6 +559,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		transMats,
 		rgb,
 		normal_opacity,
+		normal_opacity_geo,
 		grid,
 		tiles_touched,
 		prefiltered

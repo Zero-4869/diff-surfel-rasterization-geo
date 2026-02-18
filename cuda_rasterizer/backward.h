@@ -29,10 +29,12 @@ namespace BACKWARD
 		const float* bg_color,
 		const float2* means2D,
 		const float4* normal_opacity,
+		const float* normal_opacity_geo,
 		const float* transMats,
 		const float* colors,
 		const float* depths,
 		const float* final_Ts,
+		const float* final_Ts_geo,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
 		const float* dL_depths,
@@ -40,6 +42,7 @@ namespace BACKWARD
 		float3* dL_dmean2D,
 		float* dL_dnormal3D,
 		float* dL_dopacity,
+		float* dL_dopacity_geo,
 		float* dL_dcolors);
 
 	void preprocess(
