@@ -401,7 +401,7 @@ renderCUDA(
 				continue;
 			float test_T = T * (1 - alpha);
 			float test_T_geo = T_geo * (1 - alpha_geo);
-			if (test_T < 0.0001f)
+			if (test_T < 0.0001f and test_T_geo < 0.01f)
 			{
 				done = true;
 				continue;
