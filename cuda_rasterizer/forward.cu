@@ -274,7 +274,8 @@ renderCUDA(
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color,
-	float* __restrict__ out_others)
+	float* __restrict__ out_others,
+	int* out_observe)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -401,7 +402,7 @@ renderCUDA(
 				continue;
 			float test_T = T * (1 - alpha);
 			float test_T_geo = T_geo * (1 - alpha_geo);
-			if (test_T < 0.0001f and test_T_geo < 0.01f)
+			if (test_T < 0.0001f)
 			{
 				done = true;
 				continue;
@@ -425,6 +426,11 @@ renderCUDA(
 				median_depth = depth;
 				// median_weight = w;
 				median_contributor = contributor;
+			}
+
+			if (T_geo > 0.1)
+			{
+				atomicAdd(&(out_observe[collected_id[j]]), 1);
 			}
 			// Render normal map
 			for (int ch=0; ch<3; ch++) N[ch] += normal[ch] * w_geo;
@@ -486,7 +492,8 @@ void FORWARD::render(
 	uint32_t* n_contrib,
 	const float* bg_color,
 	float* out_color,
-	float* out_others)
+	float* out_others,
+	int* out_observe)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
@@ -504,7 +511,8 @@ void FORWARD::render(
 		n_contrib,
 		bg_color,
 		out_color,
-		out_others);
+		out_others,
+		out_observe);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
